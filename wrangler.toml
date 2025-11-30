@@ -1,0 +1,13 @@
+name = "rpc-concurrency-test"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[durable_objects]
+bindings = [
+  { name = "COORDINATOR", class_name = "CoordinatorDO" },
+  { name = "WORKER", class_name = "WorkerDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CoordinatorDO", "WorkerDO"]
