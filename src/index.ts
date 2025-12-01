@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   WORKER: DurableObjectNamespace<WorkerDO>;
+  TEST_KV: KVNamespace;
 }
 
 interface CallResult {
@@ -78,18 +79,34 @@ async function runConcurrentTest(
 /**
  * WorkerDO - Simple DO that simulates work with configurable delay
  */
-export class WorkerDO extends DurableObject {
+export class WorkerDO extends DurableObject<Env> {
   async doWork(workerId: number, delayMs: number): Promise<{ workerId: number; processedAt: number }> {
     const start = Date.now();
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return { workerId, processedAt: start };
   }
 
+  async writeKv(workerId: number, ttlSeconds: number): Promise<{ workerId: number; processedAt: number; key: string }> {
+    const start = Date.now();
+    const key = crypto.randomUUID();
+    await this.env.TEST_KV.put(key, String(start), { expirationTtl: ttlSeconds });
+    return { workerId, processedAt: start, key };
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const workerId = parseInt(url.searchParams.get("workerId") || "0");
-    const delayMs = parseInt(url.searchParams.get("delay") || "100");
+    const action = url.searchParams.get("action") || "work";
 
+    if (action === "kv") {
+      const ttl = parseInt(url.searchParams.get("ttl") || "60");
+      const start = Date.now();
+      const key = crypto.randomUUID();
+      await this.env.TEST_KV.put(key, String(start), { expirationTtl: ttl });
+      return Response.json({ workerId, processedAt: start, key });
+    }
+
+    const delayMs = parseInt(url.searchParams.get("delay") || "100");
     const start = Date.now();
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     return Response.json({ workerId, processedAt: start });
@@ -131,6 +148,10 @@ DO-to-DO:
 Worker-to-DO:
   /test/worker/rpc?calls=N&delay=MS&same=BOOL
   /test/worker/fetch?calls=N&delay=MS&same=BOOL
+
+KV Write (Worker -> single DO -> N random KV keys):
+  /test/kv/rpc?calls=N&ttl=SECONDS
+  /test/kv/fetch?calls=N&ttl=SECONDS
 `,
         { headers: { "Content-Type": "text/plain" } }
       );
@@ -163,6 +184,26 @@ Worker-to-DO:
       const result = await runConcurrentTest(calls, delay, same, async (workerId, delayMs) => {
         const stub = env.WORKER.get(env.WORKER.idFromName(`worker-${workerId}`));
         const res = await stub.fetch(`http://worker?workerId=${workerId}&delay=${delayMs}`);
+        return res.json() as Promise<{ processedAt: number }>;
+      });
+      return Response.json(result);
+    }
+
+    // KV write tests - Worker sends N requests to single DO, each writes to random KV key
+    const ttl = parseInt(url.searchParams.get("ttl") || "60");
+
+    if (url.pathname === "/test/kv/rpc") {
+      const stub = env.WORKER.get(env.WORKER.idFromName("worker-0"));
+      const result = await runConcurrentTest(calls, delay, same, async (workerId) => {
+        return stub.writeKv(workerId, ttl);
+      });
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/test/kv/fetch") {
+      const stub = env.WORKER.get(env.WORKER.idFromName("worker-0"));
+      const result = await runConcurrentTest(calls, delay, same, async (workerId) => {
+        const res = await stub.fetch(`http://worker?workerId=${workerId}&action=kv&ttl=${ttl}`);
         return res.json() as Promise<{ processedAt: number }>;
       });
       return Response.json(result);
