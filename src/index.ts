@@ -93,6 +93,32 @@ export class WorkerDO extends DurableObject<Env> {
     return { workerId, processedAt: start, key };
   }
 
+  async bulkWriteKv(numWrites: number, ttlSeconds: number): Promise<{
+    processedAt: number;
+    totalDuration: number;
+    writes: { key: string; startTime: number; endTime: number; duration: number }[];
+  }> {
+    const overallStart = Date.now();
+    const promises = Array.from({ length: numWrites }, async (_, i) => {
+      const writeStart = Date.now();
+      const key = crypto.randomUUID();
+      await this.env.TEST_KV.put(key, String(writeStart), { expirationTtl: ttlSeconds });
+      const writeEnd = Date.now();
+      return {
+        key,
+        startTime: writeStart - overallStart,
+        endTime: writeEnd - overallStart,
+        duration: writeEnd - writeStart,
+      };
+    });
+    const writes = await Promise.all(promises);
+    return {
+      processedAt: overallStart,
+      totalDuration: Date.now() - overallStart,
+      writes,
+    };
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const workerId = parseInt(url.searchParams.get("workerId") || "0");
@@ -152,6 +178,9 @@ Worker-to-DO:
 KV Write (Worker -> single DO -> N random KV keys):
   /test/kv/rpc?calls=N&ttl=SECONDS
   /test/kv/fetch?calls=N&ttl=SECONDS
+
+KV Bulk (single request -> DO does N concurrent KV writes):
+  /test/kv/bulk?calls=N&ttl=SECONDS
 `,
         { headers: { "Content-Type": "text/plain" } }
       );
@@ -207,6 +236,31 @@ KV Write (Worker -> single DO -> N random KV keys):
         return res.json() as Promise<{ processedAt: number }>;
       });
       return Response.json(result);
+    }
+
+    // Single request to DO that does N concurrent KV writes internally
+    if (url.pathname === "/test/kv/bulk") {
+      const stub = env.WORKER.get(env.WORKER.idFromName("worker-0"));
+      const result = await stub.bulkWriteKv(calls, ttl);
+      const durations = result.writes.map((w) => w.duration);
+      const endTimes = result.writes.map((w) => w.endTime);
+      return Response.json({
+        numWrites: calls,
+        ttl,
+        totalDuration: result.totalDuration,
+        writes: result.writes,
+        analysis: {
+          // If writes are concurrent: all durations similar, all endTimes similar
+          // If writes are serialized: durations grow linearly, endTimes spread out
+          minDuration: Math.min(...durations),
+          maxDuration: Math.max(...durations),
+          avgDuration: durations.reduce((a, b) => a + b, 0) / durations.length,
+          durationSpread: Math.max(...durations) - Math.min(...durations),
+          minEndTime: Math.min(...endTimes),
+          maxEndTime: Math.max(...endTimes),
+          endTimeSpread: Math.max(...endTimes) - Math.min(...endTimes),
+        },
+      });
     }
 
     return new Response("Not Found", { status: 404 });
