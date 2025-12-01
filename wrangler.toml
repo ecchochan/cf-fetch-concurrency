@@ -4,7 +4,7 @@ compatibility_date = "2024-09-23"
 
 [[kv_namespaces]]
 binding = "TEST_KV"
-id = "d3bdd3e864f648ff8a23076efe5cab66"
+id = "0185a943031f4783b72ef5c2f2ab3a78"
 
 [durable_objects]
 bindings = [
