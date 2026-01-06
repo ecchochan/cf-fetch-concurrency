@@ -3,7 +3,61 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   WORKER: DurableObjectNamespace<WorkerDO>;
+  QUEUE_COORDINATOR: DurableObjectNamespace<QueueCoordinatorDO>;
   TEST_KV: KVNamespace;
+  TEST_QUEUE: Queue<QueueMessage>;
+}
+
+interface QueueMessage {
+  testId: string;
+  messageId: number;
+  enqueuedAt: number;
+}
+
+interface QueueMessageResult {
+  messageId: number;
+  enqueuedAt: number;
+  processedAt: number;
+  completedAt: number;
+  workDuration: number;
+  batchId: string;
+}
+
+interface QueueEnqueueResult {
+  messageId: number;
+  startTime: number;
+  endTime: number;
+  duration: number;
+}
+
+interface QueueTestResult {
+  testId: string;
+  totalMessages: number;
+  enqueue: {
+    totalDuration: number;
+    results: QueueEnqueueResult[];
+    analysis: {
+      minDuration: number;
+      maxDuration: number;
+      avgDuration: number;
+    };
+  };
+  e2e?: {
+    results: QueueMessageResult[];
+    analysis: {
+      minLatency: number;
+      maxLatency: number;
+      avgLatency: number;
+      minWorkDuration: number;
+      maxWorkDuration: number;
+      avgWorkDuration: number;
+    };
+    batches: {
+      batchId: string;
+      size: number;
+      messageIds: number[];
+    }[];
+  };
 }
 
 interface CallResult {
@@ -81,7 +135,7 @@ async function runConcurrentTest(
   numCalls: number,
   delayMs: number,
   sameTarget: boolean,
-  callFn: (workerId: number, delayMs: number) => Promise<{ processedAt: number }>
+  callFn: (workerId: number, delayMs: number, index: number) => Promise<{ processedAt: number }>
 ): Promise<TestResult> {
   const overallStart = Date.now();
   const promises: Promise<CallResult>[] = [];
@@ -91,7 +145,7 @@ async function runConcurrentTest(
     const callStart = Date.now();
 
     const promise = (async () => {
-      const { processedAt } = await callFn(workerId, delayMs);
+      const { processedAt } = await callFn(workerId, delayMs, i);
       const callEnd = Date.now();
       const workerStartTime = processedAt - overallStart;
       const startTime = callStart - overallStart;
@@ -177,6 +231,25 @@ export class WorkerDO extends DurableObject<Env> {
     });
   }
 
+  async doRandomWork(): Promise<{ processedAt: number; completedAt: number; workDuration: number }> {
+    const processedAt = Date.now();
+    const delayMs = 100 + Math.floor(Math.random() * 400); // 100-500ms
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const completedAt = Date.now();
+    return { processedAt, completedAt, workDuration: completedAt - processedAt };
+  }
+
+  async enqueueMessage(testId: string, messageId: number): Promise<{ processedAt: number }> {
+    const processedAt = Date.now();
+    const message: QueueMessage = {
+      testId,
+      messageId,
+      enqueuedAt: processedAt,
+    };
+    await this.env.TEST_QUEUE.send(message);
+    return { processedAt };
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const workerId = parseInt(url.searchParams.get("workerId") || "0");
@@ -224,6 +297,42 @@ export class CoordinatorDO extends DurableObject<Env> {
   }
 }
 
+/**
+ * QueueCoordinatorDO - Coordinates queue test results
+ * Tracks messages sent and receives completion reports from queue consumer
+ */
+export class QueueCoordinatorDO extends DurableObject<Env> {
+  async startTest(testId: string, numMessages: number): Promise<void> {
+    await this.ctx.storage.put(`test:${testId}:expected`, numMessages);
+    await this.ctx.storage.put(`test:${testId}:results`, []);
+  }
+
+  async recordProcessed(
+    testId: string,
+    messageId: number,
+    enqueuedAt: number,
+    processedAt: number,
+    completedAt: number,
+    workDuration: number,
+    batchId: string
+  ): Promise<void> {
+    const results = (await this.ctx.storage.get<QueueMessageResult[]>(`test:${testId}:results`)) ?? [];
+    results.push({ messageId, enqueuedAt, processedAt, completedAt, workDuration, batchId });
+    await this.ctx.storage.put(`test:${testId}:results`, results);
+  }
+
+  async getResults(testId: string): Promise<{ expected: number; received: number; results: QueueMessageResult[] }> {
+    const expected = (await this.ctx.storage.get<number>(`test:${testId}:expected`)) ?? 0;
+    const results = (await this.ctx.storage.get<QueueMessageResult[]>(`test:${testId}:results`)) ?? [];
+    return { expected, received: results.length, results };
+  }
+
+  async cleanup(testId: string): Promise<void> {
+    await this.ctx.storage.delete(`test:${testId}:expected`);
+    await this.ctx.storage.delete(`test:${testId}:results`);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -249,6 +358,15 @@ KV Write (Worker -> single DO -> N random KV keys):
 KV Bulk (single request -> N concurrent KV writes):
   /test/kv/bulk?calls=N&ttl=SECONDS&storage=BOOL   (from DO)
   /test/kv/bulk-worker?calls=N&ttl=SECONDS         (from Worker, no storage option)
+
+Queue (N concurrent calls to singleton DO, each enqueues one message):
+  /test/queue?calls=N&timeout=MS
+    - Enqueue: N concurrent RPC calls to singleton DO, each calls queue.send()
+    - Consumer: processes messages, calls singleton DO for 100-500ms random work
+    - Measures enqueue latency (via runConcurrentTest queueDelay)
+    - Measures e2e latency (enqueue -> consumer complete)
+    - Reports batch analysis (how CF batched the messages)
+    - Consumer config: max_batch_size=50, max_concurrency=10
 `,
         { headers: { "Content-Type": "text/plain" } }
       );
@@ -320,6 +438,113 @@ KV Bulk (single request -> N concurrent KV writes):
       return Response.json(formatBulkResult(calls, ttl, result));
     }
 
+    // Queue test - N concurrent calls to singleton DO, each enqueues one message
+    // Measures: enqueue latency (via runConcurrentTest) + e2e latency (via polling)
+    if (url.pathname === "/test/queue") {
+      const timeout = parseInt(url.searchParams.get("timeout") || "30000");
+      const testId = crypto.randomUUID();
+
+      // Get coordinator and start test
+      const queueCoordinator = env.QUEUE_COORDINATOR.get(env.QUEUE_COORDINATOR.idFromName("queue-coordinator"));
+      await queueCoordinator.startTest(testId, calls);
+
+      // Get singleton DO that will enqueue messages
+      const enqueuerStub = env.WORKER.get(env.WORKER.idFromName("queue-enqueuer"));
+
+      // N concurrent calls to singleton DO, each enqueues one message
+      const enqueueResult = await runConcurrentTest(calls, 0, true, async (_workerId, _delayMs, index) => {
+        return enqueuerStub.enqueueMessage(testId, index);
+      });
+
+      // Poll for e2e results with timeout
+      const pollStart = Date.now();
+      let e2eData: QueueTestResult["e2e"] | undefined;
+
+      while (Date.now() - pollStart < timeout) {
+        const status = await queueCoordinator.getResults(testId);
+        if (status.received >= status.expected) {
+          // All messages processed - compute e2e analysis
+          const results = status.results;
+          const latencies = results.map((r) => r.completedAt - r.enqueuedAt);
+          const workDurations = results.map((r) => r.workDuration);
+
+          // Group by batch
+          const batchMap = new Map<string, number[]>();
+          for (const r of results) {
+            const existing = batchMap.get(r.batchId) ?? [];
+            existing.push(r.messageId);
+            batchMap.set(r.batchId, existing);
+          }
+          const batches = Array.from(batchMap.entries()).map(([batchId, messageIds]) => ({
+            batchId,
+            size: messageIds.length,
+            messageIds: messageIds.sort((a, b) => a - b),
+          }));
+
+          e2eData = {
+            results,
+            analysis: {
+              minLatency: Math.min(...latencies),
+              maxLatency: Math.max(...latencies),
+              avgLatency: latencies.reduce((a, b) => a + b, 0) / latencies.length,
+              minWorkDuration: Math.min(...workDurations),
+              maxWorkDuration: Math.max(...workDurations),
+              avgWorkDuration: workDurations.reduce((a, b) => a + b, 0) / workDurations.length,
+            },
+            batches,
+          };
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      // Cleanup
+      await queueCoordinator.cleanup(testId);
+
+      const result: QueueTestResult = {
+        testId,
+        totalMessages: calls,
+        enqueue: {
+          totalDuration: enqueueResult.totalDuration,
+          results: enqueueResult.results.map((r) => ({
+            messageId: r.workerId,
+            startTime: r.startTime,
+            endTime: r.endTime,
+            duration: r.duration,
+          })),
+          analysis: {
+            minDuration: enqueueResult.queueAnalysis.minQueueDelay,
+            maxDuration: enqueueResult.queueAnalysis.maxQueueDelay,
+            avgDuration: enqueueResult.queueAnalysis.avgQueueDelay,
+          },
+        },
+        e2e: e2eData,
+      };
+
+      return Response.json(result);
+    }
+
     return new Response("Not Found", { status: 404 });
+  },
+
+  async queue(batch: MessageBatch<QueueMessage>, env: Env): Promise<void> {
+    const batchId = crypto.randomUUID();
+    const coordinator = env.QUEUE_COORDINATOR.get(env.QUEUE_COORDINATOR.idFromName("queue-coordinator"));
+    const workerStub = env.WORKER.get(env.WORKER.idFromName("worker-singleton"));
+
+    // Process all messages in parallel to test concurrent processing within batch
+    await Promise.all(
+      batch.messages.map(async (msg) => {
+        try {
+          const { testId, messageId, enqueuedAt } = msg.body;
+          const { processedAt, completedAt, workDuration } = await workerStub.doRandomWork();
+          await coordinator.recordProcessed(testId, messageId, enqueuedAt, processedAt, completedAt, workDuration, batchId);
+          msg.ack();
+        } catch (error) {
+          console.error(`Failed to process message ${msg.body.messageId}:`, error);
+          msg.retry();
+        }
+      })
+    );
   },
 };

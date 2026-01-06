@@ -6,12 +6,26 @@ compatibility_date = "2024-09-23"
 binding = "TEST_KV"
 id = "0185a943031f4783b72ef5c2f2ab3a78"
 
+[[queues.producers]]
+binding = "TEST_QUEUE"
+queue = "concurrency-test-queue"
+
+[[queues.consumers]]
+queue = "concurrency-test-queue"
+max_batch_size = 50
+max_concurrency = 10
+
 [durable_objects]
 bindings = [
   { name = "COORDINATOR", class_name = "CoordinatorDO" },
-  { name = "WORKER", class_name = "WorkerDO" }
+  { name = "WORKER", class_name = "WorkerDO" },
+  { name = "QUEUE_COORDINATOR", class_name = "QueueCoordinatorDO" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CoordinatorDO", "WorkerDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["QueueCoordinatorDO"]
