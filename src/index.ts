@@ -4,6 +4,7 @@ interface Env {
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   WORKER: DurableObjectNamespace<WorkerDO>;
   QUEUE_COORDINATOR: DurableObjectNamespace<QueueCoordinatorDO>;
+  DISPATCHER: DurableObjectNamespace<DispatcherDO>;
   TEST_KV: KVNamespace;
   TEST_QUEUE: Queue<QueueMessage>;
 }
@@ -239,6 +240,14 @@ export class WorkerDO extends DurableObject<Env> {
     return { processedAt, completedAt, workDuration: completedAt - processedAt };
   }
 
+  async ack(workerId: number, workMs: number = 0): Promise<{ workerId: number; processedAt: number; completedAt: number }> {
+    const processedAt = Date.now();
+    if (workMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, workMs));
+    }
+    return { workerId, processedAt, completedAt: Date.now() };
+  }
+
   async enqueueMessage(testId: string, messageId: number): Promise<{ processedAt: number }> {
     const processedAt = Date.now();
     const message: QueueMessage = {
@@ -333,6 +342,364 @@ export class QueueCoordinatorDO extends DurableObject<Env> {
   }
 }
 
+interface DispatchTask {
+  id: number;
+  worker_id: number;
+  test_id: string;
+  status: string;
+  created_at: number;
+  executed_at: number | null;
+  completed_at: number | null;
+  error: string | null;
+}
+
+interface DispatchTestResult {
+  test_id: string;
+  started_at: number;
+  completed_at: number | null;
+  total_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  alarm_count: number;
+  status: string;
+}
+
+/**
+ * DispatcherDO - Singleton DO that dispatches to 2000+ worker DOs using recursive alarms
+ *
+ * Each alarm() invocation gets a fresh 1000 sub-request quota.
+ * By scheduling immediate alarms (setAlarm(Date.now())), we chain unlimited
+ * total sub-requests across multiple alarm invocations.
+ */
+export class DispatcherDO extends DurableObject<Env> {
+  private sql: SqlStorage;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+
+    // Initialize schema
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        worker_id INTEGER NOT NULL,
+        test_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        executed_at INTEGER,
+        completed_at INTEGER,
+        error TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS test_results (
+        test_id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        total_tasks INTEGER NOT NULL,
+        completed_tasks INTEGER DEFAULT 0,
+        failed_tasks INTEGER DEFAULT 0,
+        alarm_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'running'
+      );
+
+      CREATE TABLE IF NOT EXISTS worker_timings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        test_id TEXT NOT NULL,
+        worker_id INTEGER NOT NULL,
+        alarm_num INTEGER NOT NULL,
+        rpc_sent_at INTEGER NOT NULL,
+        processed_at INTEGER NOT NULL,
+        completed_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_test_status ON tasks(test_id, status);
+      CREATE INDEX IF NOT EXISTS idx_timings_test ON worker_timings(test_id);
+    `);
+  }
+
+  async startTest(numTasks: number, batchSize: number, workMs: number = 0): Promise<{ testId: string; status: string; totalTasks: number }> {
+    const testId = crypto.randomUUID();
+    const now = Date.now();
+
+    // Cancel any existing alarm and clear previous test
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.delete("current_test_id");
+
+    // Clean up old test data
+    this.sql.exec(`DELETE FROM tasks`);
+    this.sql.exec(`DELETE FROM test_results`);
+    this.sql.exec(`DELETE FROM worker_timings`);
+
+    // Store config for alarm to use
+    await this.ctx.storage.put("batch_size", batchSize);
+    await this.ctx.storage.put("work_ms", workMs);
+    await this.ctx.storage.put("alarm_num", 0);
+
+    // Insert test result record
+    this.sql.exec(
+      `INSERT INTO test_results (test_id, started_at, total_tasks, status) VALUES (?, ?, ?, 'running')`,
+      testId,
+      now,
+      numTasks
+    );
+
+    // Seed tasks
+    for (let i = 0; i < numTasks; i++) {
+      this.sql.exec(
+        `INSERT INTO tasks (worker_id, test_id, status, created_at) VALUES (?, ?, 'pending', ?)`,
+        i,
+        testId,
+        now
+      );
+    }
+
+    // Store current test ID and trigger first alarm
+    await this.ctx.storage.put("current_test_id", testId);
+    await this.ctx.storage.setAlarm(Date.now());
+
+    return { testId, status: "started", totalTasks: numTasks };
+  }
+
+  async getTestStatus(testId: string): Promise<DispatchTestResult | null> {
+    const result = this.sql.exec(`SELECT * FROM test_results WHERE test_id = ?`, testId).toArray();
+    if (result.length === 0) return null;
+    const row = result[0];
+    return {
+      test_id: row.test_id as string,
+      started_at: row.started_at as number,
+      completed_at: row.completed_at as number | null,
+      total_tasks: row.total_tasks as number,
+      completed_tasks: row.completed_tasks as number,
+      failed_tasks: row.failed_tasks as number,
+      alarm_count: row.alarm_count as number,
+      status: row.status as string,
+    };
+  }
+
+  async getTimingAnalysis(testId: string, workMs: number = 100): Promise<{
+    totalWorkers: number;
+    alarms: {
+      alarmNum: number;
+      workerCount: number;
+      rpcSentAt: number;
+      processedAtMin: number;
+      processedAtMax: number;
+      processedAtSpread: number;
+      completedAtMin: number;
+      completedAtMax: number;
+      completedAtSpread: number;
+    }[];
+    overallProcessedSpread: number;
+    analysis: {
+      avgProcessedSpread: number;
+      avgBatchSize: number;
+      theoreticalSequentialMs: number;
+      actualSpreadMs: number;
+      estimatedParallelism: string;
+      verdict: string;
+    };
+  }> {
+    const timings = this.sql
+      .exec(`SELECT * FROM worker_timings WHERE test_id = ? ORDER BY alarm_num, processed_at`, testId)
+      .toArray() as {
+        worker_id: number;
+        alarm_num: number;
+        rpc_sent_at: number;
+        processed_at: number;
+        completed_at: number;
+      }[];
+
+    if (timings.length === 0) {
+      return {
+        totalWorkers: 0,
+        alarms: [],
+        overallProcessedSpread: 0,
+        analysis: {
+          avgProcessedSpread: 0,
+          avgBatchSize: 0,
+          theoreticalSequentialMs: 0,
+          actualSpreadMs: 0,
+          estimatedParallelism: "N/A",
+          verdict: "No data",
+        },
+      };
+    }
+
+    // Group by alarm
+    const byAlarm = new Map<number, typeof timings>();
+    for (const t of timings) {
+      const arr = byAlarm.get(t.alarm_num) ?? [];
+      arr.push(t);
+      byAlarm.set(t.alarm_num, arr);
+    }
+
+    const alarms = Array.from(byAlarm.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([alarmNum, workers]) => {
+        const processedAts = workers.map((w) => w.processed_at);
+        const completedAts = workers.map((w) => w.completed_at);
+        return {
+          alarmNum,
+          workerCount: workers.length,
+          rpcSentAt: workers[0].rpc_sent_at,
+          processedAtMin: Math.min(...processedAts),
+          processedAtMax: Math.max(...processedAts),
+          processedAtSpread: Math.max(...processedAts) - Math.min(...processedAts),
+          completedAtMin: Math.min(...completedAts),
+          completedAtMax: Math.max(...completedAts),
+          completedAtSpread: Math.max(...completedAts) - Math.min(...completedAts),
+        };
+      });
+
+    const allProcessedAts = timings.map((t) => t.processed_at);
+    const overallProcessedSpread = Math.max(...allProcessedAts) - Math.min(...allProcessedAts);
+
+    // Calculate concurrency metrics
+    const avgSpread = alarms.reduce((sum, a) => sum + a.processedAtSpread, 0) / alarms.length;
+    const avgBatchSize = alarms.reduce((sum, a) => sum + a.workerCount, 0) / alarms.length;
+
+    // If sequential: batchSize workers × workMs = theoretical time
+    // Actual spread shows real parallelism
+    const theoreticalSequential = avgBatchSize * Math.max(workMs, 1);
+    const actualParallelism = theoreticalSequential / Math.max(avgSpread, 1);
+
+    return {
+      totalWorkers: timings.length,
+      alarms,
+      overallProcessedSpread,
+      analysis: {
+        avgProcessedSpread: Math.round(avgSpread),
+        avgBatchSize: Math.round(avgBatchSize),
+        theoreticalSequentialMs: theoreticalSequential,
+        actualSpreadMs: Math.round(avgSpread),
+        estimatedParallelism: `${actualParallelism.toFixed(1)}x`,
+        verdict: avgSpread < theoreticalSequential
+          ? `Concurrent: ${avgBatchSize} workers processed in ${Math.round(avgSpread)}ms (sequential would be ${theoreticalSequential}ms)`
+          : `Sequential: spread ${Math.round(avgSpread)}ms >= theoretical ${theoreticalSequential}ms`
+      }
+    };
+  }
+
+  private retryStuckTasks(testId: string, stuckThresholdMs: number): void {
+    const threshold = Date.now() - stuckThresholdMs;
+    this.sql.exec(
+      `UPDATE tasks SET status = 'pending', executed_at = NULL WHERE test_id = ? AND status = 'executing' AND executed_at < ?`,
+      testId,
+      threshold
+    );
+  }
+
+  async alarm(): Promise<void> {
+    const testId = await this.ctx.storage.get<string>("current_test_id");
+    if (!testId) return;
+
+    const batchSize = (await this.ctx.storage.get<number>("batch_size")) ?? 100;
+    const workMs = (await this.ctx.storage.get<number>("work_ms")) ?? 0;
+    const alarmNum = ((await this.ctx.storage.get<number>("alarm_num")) ?? 0) + 1;
+    await this.ctx.storage.put("alarm_num", alarmNum);
+
+    // Retry stuck tasks (executing > 10s without completion)
+    this.retryStuckTasks(testId, 10000);
+
+    // Fetch next batch
+    const batch = this.sql
+      .exec(
+        `SELECT id, worker_id FROM tasks WHERE test_id = ? AND status = 'pending' LIMIT ?`,
+        testId,
+        batchSize
+      )
+      .toArray() as Pick<DispatchTask, "id" | "worker_id">[];
+
+    if (batch.length === 0) {
+      // Check if all done
+      const pendingResult = this.sql
+        .exec(
+          `SELECT COUNT(*) as c FROM tasks WHERE test_id = ? AND status IN ('pending', 'executing')`,
+          testId
+        )
+        .toArray();
+      const pending = (pendingResult[0] as { c: number }).c;
+
+      if (pending === 0) {
+        // Complete
+        this.sql.exec(
+          `UPDATE test_results SET status = 'completed', completed_at = ? WHERE test_id = ?`,
+          Date.now(),
+          testId
+        );
+        await this.ctx.storage.delete("current_test_id");
+        return;
+      }
+      // Safety net - retry in 5s
+      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      return;
+    }
+
+    // Mark executing
+    const now = Date.now();
+    for (const task of batch) {
+      this.sql.exec(
+        `UPDATE tasks SET status = 'executing', executed_at = ? WHERE id = ?`,
+        now,
+        task.id
+      );
+    }
+
+    // Fire all RPCs in parallel
+    const rpcSentAt = Date.now();
+    const results = await Promise.allSettled(
+      batch.map(async (task) => {
+        const stub = this.env.WORKER.get(this.env.WORKER.idFromName(`worker-${task.worker_id}`));
+        const result = await stub.ack(task.worker_id, workMs);
+        return { task, result };
+      })
+    );
+
+    // Process results
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        const { task, result } = r.value;
+        this.sql.exec(`DELETE FROM tasks WHERE id = ?`, task.id);
+        this.sql.exec(
+          `UPDATE test_results SET completed_tasks = completed_tasks + 1 WHERE test_id = ?`,
+          testId
+        );
+        this.sql.exec(
+          `INSERT INTO worker_timings (test_id, worker_id, alarm_num, rpc_sent_at, processed_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)`,
+          testId,
+          task.worker_id,
+          alarmNum,
+          rpcSentAt,
+          result.processedAt,
+          result.completedAt
+        );
+      } else {
+        const task = batch.find((t) => t.id === (r as PromiseRejectedResult).reason?.taskId) ?? batch[0];
+        this.sql.exec(`UPDATE tasks SET status = 'failed', error = ? WHERE id = ?`, String(r.reason), task.id);
+        this.sql.exec(
+          `UPDATE test_results SET failed_tasks = failed_tasks + 1 WHERE test_id = ?`,
+          testId
+        );
+      }
+    }
+
+    // Increment alarm count
+    this.sql.exec(`UPDATE test_results SET alarm_count = alarm_count + 1 WHERE test_id = ?`, testId);
+
+    // Schedule next
+    const remainingResult = this.sql
+      .exec(`SELECT COUNT(*) as c FROM tasks WHERE test_id = ? AND status = 'pending'`, testId)
+      .toArray();
+    const remaining = (remainingResult[0] as { c: number }).c;
+
+    if (remaining > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1); // Near-immediate
+    } else {
+      await this.ctx.storage.setAlarm(Date.now() + 5000); // Safety net for executing tasks
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -367,6 +734,19 @@ Queue (N concurrent calls to singleton DO, each enqueues one message):
     - Measures e2e latency (enqueue -> consumer complete)
     - Reports batch analysis (how CF batched the messages)
     - Consumer config: max_batch_size=50, max_concurrency=10
+
+Dispatch (singleton DO notifies N worker DOs via recursive alarms):
+  /test/dispatch?tasks=2000&batch=100&work=100
+    - Start test: seeds N tasks, triggers alarm chain
+    - work=MS adds simulated work delay in each worker DO
+    - Each alarm processes batch tasks, then schedules next alarm
+    - Bypasses 1000 sub-request limit via alarm chaining
+  /test/dispatch/status?testId=xxx
+    - Get current test status
+  /test/dispatch/timings?testId=xxx
+    - Get concurrency analysis (processedAt spread per alarm batch)
+  /test/dispatch/poll?testId=xxx&timeout=60000
+    - Poll until completion or timeout
 `,
         { headers: { "Content-Type": "text/plain" } }
       );
@@ -522,6 +902,64 @@ Queue (N concurrent calls to singleton DO, each enqueues one message):
       };
 
       return Response.json(result);
+    }
+
+    // Dispatch test - singleton DO notifies N worker DOs via recursive alarms
+    if (url.pathname === "/test/dispatch") {
+      const tasks = parseInt(url.searchParams.get("tasks") || "2000");
+      const batch = parseInt(url.searchParams.get("batch") || "100");
+      const workMs = parseInt(url.searchParams.get("work") || "0");
+      const dispatcher = env.DISPATCHER.get(env.DISPATCHER.idFromName("dispatcher"));
+      const result = await dispatcher.startTest(tasks, batch, workMs);
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/test/dispatch/status") {
+      const testId = url.searchParams.get("testId");
+      if (!testId) {
+        return new Response("Missing testId parameter", { status: 400 });
+      }
+      const dispatcher = env.DISPATCHER.get(env.DISPATCHER.idFromName("dispatcher"));
+      const result = await dispatcher.getTestStatus(testId);
+      if (!result) {
+        return new Response("Test not found", { status: 404 });
+      }
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/test/dispatch/timings") {
+      const testId = url.searchParams.get("testId");
+      if (!testId) {
+        return new Response("Missing testId parameter", { status: 400 });
+      }
+      const dispatcher = env.DISPATCHER.get(env.DISPATCHER.idFromName("dispatcher"));
+      const result = await dispatcher.getTimingAnalysis(testId);
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/test/dispatch/poll") {
+      const testId = url.searchParams.get("testId");
+      if (!testId) {
+        return new Response("Missing testId parameter", { status: 400 });
+      }
+      const timeout = parseInt(url.searchParams.get("timeout") || "60000");
+      const dispatcher = env.DISPATCHER.get(env.DISPATCHER.idFromName("dispatcher"));
+
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < timeout) {
+        const result = await dispatcher.getTestStatus(testId);
+        if (!result) {
+          return new Response("Test not found", { status: 404 });
+        }
+        if (result.status === "completed") {
+          return Response.json(result);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+
+      // Timeout - return current status
+      const result = await dispatcher.getTestStatus(testId);
+      return Response.json({ ...result, timedOut: true });
     }
 
     return new Response("Not Found", { status: 404 });

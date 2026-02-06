@@ -19,7 +19,8 @@ max_concurrency = 10
 bindings = [
   { name = "COORDINATOR", class_name = "CoordinatorDO" },
   { name = "WORKER", class_name = "WorkerDO" },
-  { name = "QUEUE_COORDINATOR", class_name = "QueueCoordinatorDO" }
+  { name = "QUEUE_COORDINATOR", class_name = "QueueCoordinatorDO" },
+  { name = "DISPATCHER", class_name = "DispatcherDO" }
 ]
 
 [[migrations]]
@@ -29,3 +30,7 @@ new_sqlite_classes = ["CoordinatorDO", "WorkerDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["QueueCoordinatorDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["DispatcherDO"]
